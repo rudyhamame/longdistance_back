@@ -71,6 +71,26 @@ const userSchema = new mongoose.Schema(
 
 const LoverStatus = mongoose.model("LoverStatus", userSchema);
 
+const touchHistorySchema = new mongoose.Schema(
+  {
+    sessionId: {
+      type: String,
+      required: true,
+      default: SESSION_ID,
+    },
+    connectedAt: {
+      type: Date,
+      required: true,
+      default: Date.now,
+    },
+  },
+  {
+    versionKey: false,
+  },
+);
+
+const TouchHistory = mongoose.model("TouchHistory", touchHistorySchema);
+
 const createDefaultLover = (loverId) => ({
   loverId,
   displayName: loverId,
@@ -104,7 +124,7 @@ const buildSessionState = (users) => {
     };
   }
 
-  const readyLovers = REQUIRED_LOVERS.filter((loverId) => loverMap[loverId]?.hasReachedConnection === true);
+  const readyLovers = REQUIRED_LOVERS.filter((loverId) => loverMap[loverId]?.isTouching === true);
   const connectedLovers = REQUIRED_LOVERS.filter((loverId) => loverMap[loverId]?.connected === true);
   const isConnected = REQUIRED_LOVERS.every((loverId) => loverMap[loverId]?.connected === true);
   const updatedAt = REQUIRED_LOVERS
@@ -148,19 +168,21 @@ const ensureUsersExist = async () => {
 
 const refreshConnectionState = async () => {
   const users = await LoverStatus.find({ loverId: { $in: REQUIRED_LOVERS } }).lean();
-  const everyoneReady = REQUIRED_LOVERS.every((loverId) => users.find((user) => user.loverId === loverId)?.hasReachedConnection === true);
+  const everyoneTouching = REQUIRED_LOVERS.every((loverId) => users.find((user) => user.loverId === loverId)?.isTouching === true);
 
-  if (everyoneReady) {
-    await LoverStatus.updateMany(
-      { loverId: { $in: REQUIRED_LOVERS } },
-      {
-        $set: { connected: true },
-      },
-    );
-  }
+  await LoverStatus.updateMany(
+    { loverId: { $in: REQUIRED_LOVERS } },
+    {
+      $set: { connected: everyoneTouching },
+    },
+  );
 
   return LoverStatus.find({ loverId: { $in: REQUIRED_LOVERS } }).lean();
 };
+
+const isConnectionLive = (users) => REQUIRED_LOVERS.every(
+  (loverId) => users.find((user) => user.loverId === loverId)?.isTouching === true,
+);
 
 app.get("/api/health", async (_request, response) => {
   response.json({
@@ -219,9 +241,10 @@ app.post("/api/sessions/:sessionId/touch", async (request, response) => {
     }
 
     await ensureUsersExist();
+    const usersBeforeUpdate = await LoverStatus.find({ loverId: { $in: REQUIRED_LOVERS } }).lean();
+    const wasConnected = isConnectionLive(usersBeforeUpdate);
 
-    const existingUser = await LoverStatus.findOne({ loverId }).lean();
-    const hasReachedConnection = existingUser?.hasReachedConnection === true || touches >= CONNECTED_FINGER_COUNT;
+    const isTouching = touches >= CONNECTED_FINGER_COUNT;
 
     await LoverStatus.updateOne(
       { loverId },
@@ -231,8 +254,8 @@ app.post("/api/sessions/:sessionId/touch", async (request, response) => {
           partnerId: loverId === "Rod" ? "Nog" : "Rod",
           hand,
           touches,
-          isTouching: touches > 0,
-          hasReachedConnection,
+          isTouching,
+          hasReachedConnection: isTouching,
           updatedAt: new Date(),
         },
       },
@@ -240,10 +263,37 @@ app.post("/api/sessions/:sessionId/touch", async (request, response) => {
     );
 
     const users = await refreshConnectionState();
+    const isConnected = isConnectionLive(users);
+
+    if (!wasConnected && isConnected) {
+      await TouchHistory.create({
+        sessionId: SESSION_ID,
+        connectedAt: new Date(),
+      });
+    }
 
     response.json({
       ok: true,
       session: buildSessionState(users),
+    });
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown server error",
+    });
+  }
+});
+
+app.get("/api/sessions/:sessionId/history", async (_request, response) => {
+  try {
+    const items = await TouchHistory.find({ sessionId: SESSION_ID })
+      .sort({ connectedAt: -1 })
+      .limit(50)
+      .lean();
+
+    response.json({
+      ok: true,
+      history: items,
     });
   } catch (error) {
     response.status(500).json({
