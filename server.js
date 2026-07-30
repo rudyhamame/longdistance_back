@@ -91,6 +91,46 @@ const touchHistorySchema = new mongoose.Schema(
 
 const TouchHistory = mongoose.model("TouchHistory", touchHistorySchema);
 
+const audioStateSchema = new mongoose.Schema(
+  {
+    sessionId: {
+      type: String,
+      required: true,
+      unique: true,
+      default: SESSION_ID,
+    },
+    isPlaying: {
+      type: Boolean,
+      default: false,
+    },
+    pausedAtSeconds: {
+      type: Number,
+      default: 0,
+    },
+    startedFromSeconds: {
+      type: Number,
+      default: 0,
+    },
+    startedAt: {
+      type: Date,
+      default: null,
+    },
+    updatedAt: {
+      type: Date,
+      default: Date.now,
+    },
+    completionLogged: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  {
+    versionKey: false,
+  },
+);
+
+const AudioState = mongoose.model("AudioState", audioStateSchema);
+
 const createDefaultLover = (loverId) => ({
   loverId,
   displayName: loverId,
@@ -105,7 +145,27 @@ const createDefaultLover = (loverId) => ({
   updatedAt: null,
 });
 
-const buildSessionState = (users) => {
+const createDefaultAudioState = () => ({
+  sessionId: SESSION_ID,
+  isPlaying: false,
+  pausedAtSeconds: 0,
+  startedFromSeconds: 0,
+  startedAt: null,
+  updatedAt: null,
+  completionLogged: false,
+});
+
+const getAudioCurrentTime = (audioState, now = Date.now()) => {
+  if (!audioState) return 0;
+  if (!audioState.isPlaying || !audioState.startedAt) {
+    return Math.max(0, Number(audioState.pausedAtSeconds) || 0);
+  }
+
+  const elapsedSeconds = Math.max(0, now - new Date(audioState.startedAt).getTime()) / 1000;
+  return Math.max(0, (Number(audioState.startedFromSeconds) || 0) + elapsedSeconds);
+};
+
+const buildSessionState = (users, audioState) => {
   const loverMap = Object.fromEntries(REQUIRED_LOVERS.map((loverId) => [loverId, createDefaultLover(loverId)]));
 
   for (const user of users) {
@@ -132,6 +192,7 @@ const buildSessionState = (users) => {
     .filter(Boolean)
     .sort()
     .at(-1) || null;
+  const normalizedAudioState = audioState || createDefaultAudioState();
 
   return {
     sessionId: SESSION_ID,
@@ -143,6 +204,14 @@ const buildSessionState = (users) => {
       requiredFingers: CONNECTED_FINGER_COUNT,
       loggedInLovers: REQUIRED_LOVERS.filter((loverId) => loverMap[loverId]?.isLoggedIn === true),
       updatedAt,
+    },
+    audio: {
+      isPlaying: normalizedAudioState.isPlaying === true,
+      currentTime: getAudioCurrentTime(normalizedAudioState),
+      pausedAtSeconds: Math.max(0, Number(normalizedAudioState.pausedAtSeconds) || 0),
+      startedAt: normalizedAudioState.startedAt,
+      updatedAt: normalizedAudioState.updatedAt,
+      completionLogged: normalizedAudioState.completionLogged === true,
     },
   };
 };
@@ -166,9 +235,61 @@ const ensureUsersExist = async () => {
   }
 };
 
+const ensureAudioStateExists = async () => {
+  await AudioState.updateOne(
+    { sessionId: SESSION_ID },
+    {
+      $setOnInsert: createDefaultAudioState(),
+    },
+    { upsert: true },
+  );
+};
+
+const syncAudioState = async (wasConnected, isConnected) => {
+  await ensureAudioStateExists();
+  const audioState = await AudioState.findOne({ sessionId: SESSION_ID }).lean();
+  const now = new Date();
+
+  if (!audioState) {
+    return createDefaultAudioState();
+  }
+
+  if (!wasConnected && isConnected) {
+    await AudioState.updateOne(
+      { sessionId: SESSION_ID },
+      {
+        $set: {
+          isPlaying: true,
+          startedFromSeconds: Math.max(0, Number(audioState.pausedAtSeconds) || 0),
+          startedAt: now,
+          updatedAt: now,
+          completionLogged: false,
+        },
+      },
+    );
+  } else if (wasConnected && !isConnected) {
+    const pausedAtSeconds = getAudioCurrentTime(audioState, now.getTime());
+    await AudioState.updateOne(
+      { sessionId: SESSION_ID },
+      {
+        $set: {
+          isPlaying: false,
+          pausedAtSeconds,
+          startedFromSeconds: pausedAtSeconds,
+          startedAt: null,
+          updatedAt: now,
+        },
+      },
+    );
+  }
+
+  return AudioState.findOne({ sessionId: SESSION_ID }).lean();
+};
+
 const refreshConnectionState = async () => {
   const users = await LoverStatus.find({ loverId: { $in: REQUIRED_LOVERS } }).lean();
   const everyoneTouching = REQUIRED_LOVERS.every((loverId) => users.find((user) => user.loverId === loverId)?.isTouching === true);
+  const wasConnected = REQUIRED_LOVERS.every((loverId) => users.find((user) => user.loverId === loverId)?.connected === true);
 
   await LoverStatus.updateMany(
     { loverId: { $in: REQUIRED_LOVERS } },
@@ -177,7 +298,13 @@ const refreshConnectionState = async () => {
     },
   );
 
-  return LoverStatus.find({ loverId: { $in: REQUIRED_LOVERS } }).lean();
+  const refreshedUsers = await LoverStatus.find({ loverId: { $in: REQUIRED_LOVERS } }).lean();
+  const audioState = await syncAudioState(wasConnected, everyoneTouching);
+
+  return {
+    users: refreshedUsers,
+    audioState,
+  };
 };
 
 const isConnectionLive = (users) => REQUIRED_LOVERS.every(
@@ -214,12 +341,12 @@ app.post("/api/auth/login", async (request, response) => {
       },
     );
 
-    const users = await refreshConnectionState();
+    const { users, audioState } = await refreshConnectionState();
 
     response.json({
       ok: true,
       lover: users.find((user) => user.loverId === loverId) ?? null,
-      session: buildSessionState(users),
+      session: buildSessionState(users, audioState),
     });
   } catch (error) {
     response.status(500).json({
@@ -262,19 +389,66 @@ app.post("/api/sessions/:sessionId/touch", async (request, response) => {
       { upsert: true },
     );
 
-    const users = await refreshConnectionState();
+    const { users, audioState } = await refreshConnectionState();
     const isConnected = isConnectionLive(users);
-
-    if (!wasConnected && isConnected) {
-      await TouchHistory.create({
-        sessionId: SESSION_ID,
-        connectedAt: new Date(),
-      });
-    }
 
     response.json({
       ok: true,
-      session: buildSessionState(users),
+      session: buildSessionState(users, audioState),
+    });
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown server error",
+    });
+  }
+});
+
+app.post("/api/sessions/:sessionId/complete", async (request, response) => {
+  try {
+    await ensureUsersExist();
+    await ensureAudioStateExists();
+
+    const currentTime = Math.max(0, Number(request.body?.currentTime) || 0);
+    const users = await LoverStatus.find({ loverId: { $in: REQUIRED_LOVERS } }).lean();
+    const audioState = await AudioState.findOne({ sessionId: SESSION_ID }).lean();
+    const isConnected = REQUIRED_LOVERS.every((loverId) => users.find((user) => user.loverId === loverId)?.connected === true);
+
+    if (!isConnected || !audioState || audioState.completionLogged === true) {
+      response.json({
+        ok: true,
+        session: buildSessionState(users, audioState),
+      });
+      return;
+    }
+
+    const now = new Date();
+
+    await TouchHistory.create({
+      sessionId: SESSION_ID,
+      connectedAt: now,
+    });
+
+    await AudioState.updateOne(
+      { sessionId: SESSION_ID },
+      {
+        $set: {
+          isPlaying: false,
+          pausedAtSeconds: 0,
+          startedFromSeconds: 0,
+          startedAt: null,
+          updatedAt: now,
+          completionLogged: true,
+        },
+      },
+    );
+
+    const refreshedAudioState = await AudioState.findOne({ sessionId: SESSION_ID }).lean();
+
+    response.json({
+      ok: true,
+      session: buildSessionState(users, refreshedAudioState),
+      completedAtSeconds: currentTime,
     });
   } catch (error) {
     response.status(500).json({
@@ -303,14 +477,29 @@ app.get("/api/sessions/:sessionId/history", async (_request, response) => {
   }
 });
 
-app.get("/api/sessions/:sessionId", async (_request, response) => {
+app.delete("/api/sessions/:sessionId/history", async (_request, response) => {
   try {
-    await ensureUsersExist();
-    const users = await refreshConnectionState();
+    await TouchHistory.deleteMany({ sessionId: SESSION_ID });
 
     response.json({
       ok: true,
-      session: buildSessionState(users),
+    });
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown server error",
+    });
+  }
+});
+
+app.get("/api/sessions/:sessionId", async (_request, response) => {
+  try {
+    await ensureUsersExist();
+    const { users, audioState } = await refreshConnectionState();
+
+    response.json({
+      ok: true,
+      session: buildSessionState(users, audioState),
     });
   } catch (error) {
     response.status(500).json({
@@ -330,6 +519,7 @@ const start = async () => {
       dbName: process.env.DB_NAME || "longdistance",
     });
     await ensureUsersExist();
+    await ensureAudioStateExists();
 
     app.listen(port, () => {
       console.log(`ld_back listening on http://localhost:${port}`);
