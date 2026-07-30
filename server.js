@@ -51,6 +51,14 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    isLoggedIn: {
+      type: Boolean,
+      default: false,
+    },
+    lastLoginAt: {
+      type: Date,
+      default: null,
+    },
     updatedAt: {
       type: Date,
       default: Date.now,
@@ -72,6 +80,8 @@ const createDefaultLover = (loverId) => ({
   isTouching: false,
   hasReachedConnection: false,
   connected: false,
+  isLoggedIn: false,
+  lastLoginAt: null,
   updatedAt: null,
 });
 
@@ -88,6 +98,8 @@ const buildSessionState = (users) => {
       isTouching: user.isTouching,
       hasReachedConnection: user.hasReachedConnection,
       connected: user.connected,
+      isLoggedIn: user.isLoggedIn,
+      lastLoginAt: user.lastLoginAt,
       updatedAt: user.updatedAt,
     };
   }
@@ -109,6 +121,7 @@ const buildSessionState = (users) => {
       readyLovers,
       connectedLovers,
       requiredFingers: CONNECTED_FINGER_COUNT,
+      loggedInLovers: REQUIRED_LOVERS.filter((loverId) => loverMap[loverId]?.isLoggedIn === true),
       updatedAt,
     },
   };
@@ -156,6 +169,42 @@ app.get("/api/health", async (_request, response) => {
     database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
     timestamp: new Date().toISOString(),
   });
+});
+
+app.post("/api/auth/login", async (request, response) => {
+  try {
+    const loverId = normalizeLoverId(request.body?.loverId);
+    if (!loverId) {
+      response.status(400).json({ ok: false, error: "loverId must be Rod or Nog" });
+      return;
+    }
+
+    await ensureUsersExist();
+
+    await LoverStatus.updateOne(
+      { loverId },
+      {
+        $set: {
+          isLoggedIn: true,
+          lastLoginAt: new Date(),
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    const users = await refreshConnectionState();
+
+    response.json({
+      ok: true,
+      lover: users.find((user) => user.loverId === loverId) ?? null,
+      session: buildSessionState(users),
+    });
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown server error",
+    });
+  }
 });
 
 app.post("/api/sessions/:sessionId/touch", async (request, response) => {
